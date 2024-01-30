@@ -1,71 +1,83 @@
-use std::env;
+use std::{time::{Instant, Duration}, path::Path};
 use std::io::{stdout, Write};
 use image::GenericImageView;
 use crossterm::{
     ExecutableCommand, QueueableCommand, cursor,
     event::{self, Event},
-    style::{self, Stylize},
+    style::{self, Stylize, PrintStyledContent},
     terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
-    Result,
 };
 
-// Time given between frames for checking for new terminal events. Can also be used to speed up/slow
-// down playback.
-const EVENTS_POLLING_TIMEOUT: f32 = 1.0/144.0;
+// Video frame rate
+const TARGET_FRAME_RATE: f32 = 30.0;
+
+// the duration caclucaltion itself takes some time. adjust for that here.
+const CORRECTION_OFFSET: f32 = 0.75;
+const EVENT_POLL_TIMEOUT: f32 = 1.0/(TARGET_FRAME_RATE + CORRECTION_OFFSET);
 
 fn main() {
+    let mut args = std::env::args();
+    // executable path
+    args.next();
+
+    let ext = match args.next().unwrap_or("bmp".to_string()).as_str() {
+        "jpg" => "jpg",
+        "jpeg" => "jpeg",
+        "bmp" => "bmp",
+        "png" => "png",
+        s => {
+            println!("Error: unknown file extension type {s}");
+            return;
+        }
+    };
+
     let mut w = stdout();
-    run(&mut w, check_truecolour_support()).unwrap();
+    run(&mut w, ext).unwrap_or_else(|e| {
+        terminal::disable_raw_mode().unwrap();
+        w.execute(cursor::Show).unwrap();
+        w.execute(LeaveAlternateScreen).unwrap();
+        println!("Error encountered: {e}");
+    });
 }
 
-pub fn run<W>(stdout: &mut W, truecolour: bool) -> Result<()>
-where
-    W: Write,
-{
+pub fn run<W: Write>(stdout: &mut W, file_ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(terminal::Clear(ClearType::All))?.execute(cursor::Hide)?;
 
     let (mut size_x, mut size_y) = terminal::size()?;
-    let (img_width, img_height) = image::open("./images/1.bmp").unwrap().dimensions();
-    let number_of_images = get_image_no(std::path::Path::new("./images/")).unwrap();
+    let Ok(img) = image::open(format!("./images/1.{file_ext}")) else {
+        return Err("Could not open the first image.".to_string().into());
+    };
+    let (img_width, img_height) = img.dimensions();
+
+    let number_of_images = get_image_no(Path::new("./images/"), file_ext)?;
 
     // Resize image to fit in terminal. Does not maintain original aspect ratio.
     let mut scale_x: f32 = img_width as f32 / size_x as f32;
     let mut scale_y: f32 = img_height as f32 / size_y as f32;
 
     for n in 1..=number_of_images {
-        let image = image::open(format!("./images/{}.bmp", n)).unwrap().into_luma8();
+        let frame_start = Instant::now();
+        let image = image::open(format!("./images/{}.jpg", n))?;
+        let screen = vec![vec!['█'; size_x.into()]; size_y.into()];
 
-        for y in 0..size_y {
-            for x in 0..size_x {
-                let pixel = image.get_pixel(
+        let frame = screen.into_iter().enumerate().flat_map(|(y, v)| {
+            v.into_iter().enumerate().map(|(x, _)| {
+                let p = image.get_pixel(
                     (x as f32 * scale_x) as u32,
                     (y as f32 * scale_y) as u32
                 );
-                let colour = pixel[0];
+                '█'.with(style::Color::Rgb { r: p[0], g: p[1], b: p[2]})
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
 
-                // If terminal supports truecolour, use it. Otherwise keep it limited to only 2
-                // colours.
-                if truecolour {
-                    stdout
-                        .queue(cursor::MoveTo(x, y))?
-                        .queue(style::PrintStyledContent("█".with(style::Color::Rgb { r: colour, g: colour, b: colour })))?;
-                } else if colour >= 130 {
-                    stdout
-                        .queue(cursor::MoveTo(x, y))?
-                        .queue(style::Print("█"))?;
-
-                } else {
-                    stdout
-                        .queue(cursor::MoveTo(x, y))?
-                        .queue(style::Print(" "))?;
-                }
-            }
-        }
+        frame.iter().for_each(|pixel| {
+            stdout.queue(PrintStyledContent(*pixel)).unwrap();
+        });
         stdout.flush()?;
 
-        if event::poll(std::time::Duration::from_secs_f32(EVENTS_POLLING_TIMEOUT))? {
+        if event::poll(Duration::from_secs_f32(EVENT_POLL_TIMEOUT).checked_sub(Instant::now() - frame_start).unwrap_or(Duration::ZERO))? {
             match event::read()? {
                 Event::Key(key_ev) => if key_ev.code == event::KeyCode::Char('q') { break; },
                 Event::Resize(x, y) => {
@@ -85,28 +97,16 @@ where
     Ok(())
 }
 
-fn get_image_no(image_dir: &std::path::Path) -> std::io::Result<u16> {
+fn get_image_no(image_dir: &Path, file_ext: &str) -> std::io::Result<u16> {
     let mut no_frames = 0u16;
     for entry in std::fs::read_dir(image_dir)? {
         let path = entry?;
         if let Some(ext) = path.path().extension() {
-            if ext == "bmp" {
+            if ext == file_ext {
                 no_frames += 1;
             }
         }
     }
 
     Ok(no_frames)
-}
-
-fn check_truecolour_support() -> bool {
-    if let Ok(var) = env::var("COLORTERM") {
-        if var == "truecolor" || var == "24bit" {
-            return true;
-        }
-    }
-    if env::var("WT_SESSION").is_ok() {
-        return true;
-    }
-    false
 }
